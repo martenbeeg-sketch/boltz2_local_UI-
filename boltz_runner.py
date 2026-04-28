@@ -15,6 +15,8 @@ import numpy as np
 
 
 VALID_AMINO_ACIDS = set("ACDEFGHIKLMNPQRSTVWY")
+VALID_DNA_BASES = set("ACGTN")
+VALID_RNA_BASES = set("ACGUN")
 MIN_SEQ_LENGTH = 10
 MAX_SEQ_LENGTH = 2500
 DEFAULT_BOLTZ_CACHE_DIR = "/mnt/db/reference_files/boltz_models"
@@ -73,11 +75,89 @@ def validate_smiles(smiles: str) -> tuple[bool, str]:
     if not smiles or not smiles.strip():
         return True, ""
     smiles = smiles.strip()
-    allowed = set("CNOPSFIBrcnosp[]()=#@+-.0123456789\\/Hhelakbr")
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz[]()=#@+-.0123456789\\/,:")
     invalid = set(smiles) - allowed
     if invalid:
         return False, f"Invalid SMILES characters: {', '.join(sorted(invalid))}"
     return True, smiles
+
+
+def validate_dna(sequence: str) -> tuple[bool, str]:
+    seq = sequence.upper().replace(" ", "").replace("\n", "")
+    invalid = set(seq) - VALID_DNA_BASES
+    if invalid:
+        return False, f"Invalid DNA bases: {', '.join(sorted(invalid))}"
+    if len(seq) < 2:
+        return False, "DNA sequence too short."
+    return True, seq
+
+
+def validate_rna(sequence: str) -> tuple[bool, str]:
+    seq = sequence.upper().replace(" ", "").replace("\n", "")
+    invalid = set(seq) - VALID_RNA_BASES
+    if invalid:
+        return False, f"Invalid RNA bases: {', '.join(sorted(invalid))}"
+    if len(seq) < 2:
+        return False, "RNA sequence too short."
+    return True, seq
+
+
+def parse_entities(entities: list[dict]) -> tuple[list[dict], Optional[str], str]:
+    normalized: list[dict] = []
+    first_protein_sequence: Optional[str] = None
+    first_protein_header = "protein"
+
+    for item in entities:
+        entity_type = str(item.get("type", "protein")).strip().lower()
+        copies = int(item.get("copies", 1) or 1)
+        raw_input = str(item.get("input", "") or "").strip()
+        use_affinity = bool(item.get("use_affinity", False))
+        cyclic = bool(item.get("cyclic", False))
+        if copies < 1:
+            return [], None, "Copies must be >= 1 for all entities."
+        if not raw_input:
+            return [], None, f"Input is required for entity type '{entity_type}'."
+
+        if entity_type == "protein":
+            header, seq = parse_fasta(raw_input)
+            ok, seq_or_error = validate_protein(seq)
+            if not ok:
+                return [], None, seq_or_error
+            clean_input = seq_or_error
+            if first_protein_sequence is None:
+                first_protein_sequence = clean_input
+                first_protein_header = header
+        elif entity_type == "dna":
+            ok, seq_or_error = validate_dna(raw_input)
+            if not ok:
+                return [], None, seq_or_error
+            clean_input = seq_or_error
+        elif entity_type == "rna":
+            ok, seq_or_error = validate_rna(raw_input)
+            if not ok:
+                return [], None, seq_or_error
+            clean_input = seq_or_error
+        elif entity_type in {"ligand", "ion"}:
+            ok, smiles_or_error = validate_smiles(raw_input)
+            if not ok:
+                return [], None, smiles_or_error
+            clean_input = smiles_or_error
+        else:
+            return [], None, f"Unsupported entity type: {entity_type}"
+
+        normalized.append(
+            {
+                "type": entity_type,
+                "copies": copies,
+                "input": clean_input,
+                "use_affinity": use_affinity,
+                "cyclic": cyclic,
+            }
+        )
+
+    if first_protein_sequence is None:
+        return [], None, "At least one protein entity is required."
+    return normalized, first_protein_sequence, first_protein_header
 
 
 def create_boltz_yaml(
@@ -85,6 +165,7 @@ def create_boltz_yaml(
     output_dir: str,
     *,
     ligand_smiles: Optional[str] = None,
+    entities: Optional[list[dict]] = None,
     msa_path: Optional[str] = None,
     enable_affinity: bool = True,
     num_copies: int = 1,
@@ -93,6 +174,7 @@ def create_boltz_yaml(
     yaml_text = build_boltz_yaml_text(
         sequence=sequence,
         ligand_smiles=ligand_smiles,
+        entities=entities,
         msa_path=msa_path,
         enable_affinity=enable_affinity,
         num_copies=num_copies,
@@ -108,11 +190,19 @@ def build_boltz_yaml_text(
     *,
     sequence: str,
     ligand_smiles: Optional[str] = None,
+    entities: Optional[list[dict]] = None,
     msa_path: Optional[str] = None,
     enable_affinity: bool = True,
     num_copies: int = 1,
     cyclic: bool = False,
 ) -> str:
+    if entities:
+        return build_boltz_yaml_text_from_entities(
+            entities=entities,
+            msa_path=msa_path,
+            global_enable_affinity=enable_affinity,
+        )
+
     chain_ids = [chr(ord("A") + idx) for idx in range(num_copies)]
     lines = ["version: 1", "sequences:", "  - protein:"]
     if num_copies > 1:
@@ -145,9 +235,64 @@ def build_boltz_yaml_text(
     return "\n".join(lines) + "\n"
 
 
+def build_boltz_yaml_text_from_entities(
+    *,
+    entities: list[dict],
+    msa_path: Optional[str],
+    global_enable_affinity: bool,
+) -> str:
+    lines = ["version: 1", "sequences:"]
+    next_chain_idx = 0
+    affinity_ids: list[str] = []
+    msa_assigned = False
+
+    for entity in entities:
+        entity_type = entity["type"]
+        copies = int(entity["copies"])
+        input_value = entity["input"]
+        use_affinity = bool(entity.get("use_affinity", False))
+        cyclic = bool(entity.get("cyclic", False))
+
+        chain_ids = [chr(ord("A") + next_chain_idx + idx) for idx in range(copies)]
+        next_chain_idx += copies
+        if copies > 1:
+            id_field = "[" + ", ".join(f'"{cid}"' for cid in chain_ids) + "]"
+        else:
+            id_field = f'"{chain_ids[0]}"'
+
+        yaml_type = "ligand" if entity_type == "ion" else entity_type
+        lines.append(f"  - {yaml_type}:")
+        lines.append(f"      id: {id_field}")
+
+        if yaml_type in {"protein", "dna", "rna"}:
+            lines.append(f"      sequence: {input_value}")
+            if yaml_type == "protein" and msa_path and not msa_assigned:
+                lines.append(f"      msa: {msa_path}")
+                msa_assigned = True
+            if yaml_type == "protein" and cyclic:
+                lines.append("      cyclic: true")
+        else:
+            lines.append(f'      smiles: "{input_value}"')
+            if global_enable_affinity and use_affinity:
+                affinity_ids.extend(chain_ids)
+
+    if affinity_ids:
+        lines.append("properties:")
+        for ligand_id in affinity_ids:
+            lines.extend(
+                [
+                    "  - affinity:",
+                    f'      binder: "{ligand_id}"',
+                ]
+            )
+
+    return "\n".join(lines) + "\n"
+
+
 def run_prediction(
     protein_text: str,
     ligand_smiles: str,
+    entities: Optional[list[dict]] = None,
     *,
     job_name: str,
     results_dir: str,
@@ -172,17 +317,28 @@ def run_prediction(
     if not job_name or not job_name.strip():
         return PredictionResult(False, "Job name is required.", job_dir="")
 
-    header, sequence = parse_fasta(protein_text)
-    ok, protein_or_error = validate_protein(sequence)
-    if not ok:
-        return PredictionResult(False, protein_or_error, job_dir="")
+    if entities:
+        normalized_entities, first_protein_sequence, header_or_error = parse_entities(entities)
+        if not normalized_entities:
+            return PredictionResult(False, header_or_error, job_dir="")
+        sequence = first_protein_sequence or ""
+        header = header_or_error
+        ligand_smiles_present = any(e["type"] in {"ligand", "ion"} for e in normalized_entities)
+        entities_for_yaml = normalized_entities
+    else:
+        header, sequence = parse_fasta(protein_text)
+        ok, protein_or_error = validate_protein(sequence)
+        if not ok:
+            return PredictionResult(False, protein_or_error, job_dir="")
 
-    ok, smiles_or_error = validate_smiles(ligand_smiles)
-    if not ok:
-        return PredictionResult(False, smiles_or_error, job_dir="")
+        ok, smiles_or_error = validate_smiles(ligand_smiles)
+        if not ok:
+            return PredictionResult(False, smiles_or_error, job_dir="")
 
-    sequence = protein_or_error
-    ligand_smiles = smiles_or_error or None
+        sequence = protein_or_error
+        ligand_smiles = smiles_or_error or None
+        ligand_smiles_present = bool(ligand_smiles)
+        entities_for_yaml = None
     cache_dir = cache_dir or os.getenv("BOLTZ_CACHE_DIR", DEFAULT_BOLTZ_CACHE_DIR)
     msa_repository_dir = (
         msa_repository_dir
@@ -226,6 +382,7 @@ def run_prediction(
         sequence,
         job_dir,
         ligand_smiles=ligand_smiles,
+        entities=entities_for_yaml,
         msa_path=yaml_msa_path,
         enable_affinity=enable_affinity,
         num_copies=int(num_copies),
@@ -305,7 +462,7 @@ def run_prediction(
     structure_text = Path(structure_path).read_text(encoding="utf-8")
     confidence_files = find_confidence_files(job_dir)
     metrics = collect_metrics(confidence_files["json_files"])
-    expects_affinity = bool(ligand_smiles and enable_affinity)
+    expects_affinity = bool(ligand_smiles_present and enable_affinity)
     affinity_found = "affinity" in metrics or "binding_probability" in metrics
     status_message = f"Prediction complete for {len(sequence)} aa sequence ({header})."
     if expects_affinity and not affinity_found:
@@ -328,8 +485,12 @@ def create_job_dir(job_name: str, results_dir: str) -> str:
     results_root = Path(results_dir or os.getenv("BOLTZ_RESULTS_DIR", DEFAULT_RESULTS_DIR))
     results_root.mkdir(parents=True, exist_ok=True)
     safe_header = re.sub(r"[^A-Za-z0-9_-]+", "_", job_name).strip("_") or "protein"
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_dir = results_root / f"{timestamp}_{safe_header[:30]}"
+    if re.match(r"^\d{8}_\d{6}_[A-Za-z0-9_-]+$", safe_header):
+        base_name = safe_header
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_name = f"{timestamp}_{safe_header[:30]}"
+    base_dir = results_root / base_name
     candidate = base_dir
     suffix = 1
     while candidate.exists():
