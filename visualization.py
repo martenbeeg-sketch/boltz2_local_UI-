@@ -34,7 +34,7 @@ def viewer_html(structure_text: str, fmt: str = "cif") -> str:
     const viewer = $3Dmol.createViewer("viewer", {{ backgroundColor: "#0f172a" }});
     let structure = "{escaped}";
     structure = structure.replace(/\\\\n/g, "\\n");
-    viewer.addModel(structure, "{fmt}");
+    const model = viewer.addModel(structure, "{fmt}");
     viewer.setStyle({{}}, {{
       cartoon: {{
         colorfunc: function(atom) {{
@@ -46,10 +46,31 @@ def viewer_html(structure_text: str, fmt: str = "cif") -> str:
         }}
       }}
     }});
-    viewer.setStyle({{hetflag: true}}, {{
+    // Keep original hetero styling for small molecules.
+    viewer.addStyle({{hetflag: true}}, {{
       stick: {{ colorscheme: "greenCarbon", radius: 0.2 }},
       sphere: {{ scale: 0.25 }}
     }});
+    // Explicit ion overlay so monoatomic ions remain visible (e.g., Na+).
+    // Detect ions from parsed atoms to avoid selector mismatches across formats.
+    const ionTags = new Set(["NA", "K", "CA", "MG", "ZN", "MN", "FE", "CU", "CL"]);
+    const hetAtoms = model.selectedAtoms({{ hetflag: true }}) || [];
+    const ionSerials = [];
+    for (const atom of hetAtoms) {{
+      const elem = String(atom.elem || "").toUpperCase();
+      const atomName = String(atom.atom || "").toUpperCase();
+      const resn = String(atom.resn || "").toUpperCase();
+      if (ionTags.has(elem) || ionTags.has(atomName) || ionTags.has(resn)) {{
+        if (atom.serial !== undefined) {{
+          ionSerials.push(atom.serial);
+        }}
+      }}
+    }}
+    if (ionSerials.length > 0) {{
+      viewer.setStyle({{ serial: ionSerials }}, {{
+        sphere: {{ colorscheme: "Jmol", radius: 1.45 }}
+      }});
+    }}
     viewer.zoomTo();
     viewer.render();
   </script>
