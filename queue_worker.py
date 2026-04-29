@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -88,7 +89,10 @@ def finalize_job(job_id: str, result) -> None:
 
 def run_job(job: dict):
     settings = job["settings"]
-    run_name = (job.get("run_name") or job.get("name") or "job").strip()
+    run_name = (job.get("run_name") or "").strip()
+    display_name = (job.get("name") or "job").strip()
+    if not re.match(r"^\d{8}_\d{6}_[A-Za-z0-9_-]+(?:_\d+)?$", run_name):
+        run_name = display_name
     return run_prediction(
         "",
         "",

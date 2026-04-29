@@ -763,18 +763,36 @@ def find_confidence_files(base_dir: str) -> dict:
 def collect_metrics(json_files: list[str]) -> dict:
     metrics = {}
     key_map = {
+        # Confidence-style keys
+        "confidence_score": "confidence_score",
         "confidence": "confidence",
         "plddt": "plddt",
         "ptm": "ptm",
+        "iptm": "iptm",
+        "ligand_iptm": "ligand_iptm",
+        "protein_iptm": "protein_iptm",
+        "complex_plddt": "complex_plddt",
+        "complex_iplddt": "complex_iplddt",
+        "complex_pde": "complex_pde",
+        "complex_ipde": "complex_ipde",
+        "chains_ptm": "chains_ptm",
+        "pair_chains_iptm": "pair_chains_iptm",
+        # Affinity-style keys
         "affinity": "affinity",
         "affinity_pred_value": "affinity",
         "affinity_probability_binary": "binding_probability",
+        "affinity_pred_value1": "affinity_pred_value1",
+        "affinity_probability_binary1": "affinity_probability_binary1",
+        "affinity_pred_value2": "affinity_pred_value2",
+        "affinity_probability_binary2": "affinity_probability_binary2",
     }
     for path in json_files:
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 data = json.load(handle)
         except Exception:
+            continue
+        if not isinstance(data, dict):
             continue
         for source_key, target_key in key_map.items():
             if source_key in data and target_key not in metrics:

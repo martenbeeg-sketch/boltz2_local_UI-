@@ -1,4 +1,5 @@
 import json
+import io
 import os
 import queue
 import re
@@ -14,6 +15,8 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
+from copy import deepcopy
+import zipfile
 
 import numpy as np
 import streamlit as st
@@ -46,6 +49,7 @@ EVENT_SERVER_PUBLISH_URL = f"http://127.0.0.1:{EVENT_SERVER_PORT}/publish"
 EXAMPLE_PROTEIN = """>THRbeta_human
 HKPEPTDEEWELIKTVTEAHVATNAQGSHWKQKRKFLPEDIGQAPIVNAPEGGKVDLEAFSHFTKIITPAITRVVDFAKKLPMFCELPCEDQIILLKGCCMEIMSLRAAVRYDPESETLTLNGEMAVTRGQLKNGGLGVVSDAIFDLGMSLSSFNLDDTEVALLQAVLLMSSDRPGLACVERIEKYQDSFLLAFEHYINYRKHHVTHFWPKLLMKVTDLRMIGACHASRFLHMKVECPTELFPPLFLEVFED"""
 EXAMPLE_LIGAND = "OC1=C(I)C=C(OC2=C(I)C=C(C[C@H](N)C(O)=O)C=C2I)C=C1"
+EXAMPLE_RBDWT = "RVQPTESIVRFPNITNLCPFGEVFNATRFASVYAWNRKRISNCVADYSVLYNSASFSTFKCYGVSPTKLNDLCFTNVYADSFVIRGDEVRQIAPGQTGKIADYNYKLPDDFTGCVIAWNSNNLDSKVGGNYNYLYRLFRKSNLKPFERDISTEIYQAGSTPCNGVEGFNCYFPLQSYGFQPTNGVGYQPYRVVVLSFELLHAPATVCGPKKSTNLVKNKCVNF"
 
 ION_PRESETS = {
     "None": "",
@@ -61,6 +65,20 @@ ION_PRESETS = {
 }
 ENTITY_TYPES = ["protein", "dna", "rna", "ligand", "ion"]
 JOB_STATUS_ORDER = ["queued", "running", "completed", "failed"]
+METRIC_HELP = {
+    "complex_plddt": "Local structure confidence for the full complex (0-1). Higher is better.",
+    "complex_pde": "Local distance error proxy in Angstrom. Lower is better.",
+    "ptm": "Global fold/topology confidence (0-1). Higher is better.",
+    "confidence_score": "Overall confidence score used for ranking. Higher is better.",
+    "iptm": "Interface confidence across interacting chains (0-1). Higher is better.",
+    "ligand_iptm": "Interface confidence for protein-ligand contacts. Higher is better.",
+    "protein_iptm": "Interface confidence for protein-protein contacts. Higher is better.",
+    "complex_iplddt": "Interface-weighted local confidence. Higher is better.",
+    "complex_ipde": "Interface-weighted distance error in Angstrom. Lower is better.",
+    "affinity": "Model affinity output: log10(IC50 in uM). Lower means stronger predicted binding.",
+    "ic50_uM": "IC50 estimate derived from affinity, in micromolar (uM). Lower is better.",
+    "binding_probability": "Predicted probability that ligand is a binder (0-1). Higher is better.",
+}
 
 EVENT_COMPONENT_JS = """
 export default function(component) {
@@ -227,6 +245,20 @@ def ensure_state() -> None:
         st.session_state["selected_job_ids"] = []
     if "pending_delete_job_ids" not in st.session_state:
         st.session_state["pending_delete_job_ids"] = []
+    if "selected_batch_id" not in st.session_state:
+        st.session_state["selected_batch_id"] = None
+    if "last_batch_mode" not in st.session_state:
+        st.session_state["last_batch_mode"] = "none"
+    if "pending_delete_batch_id" not in st.session_state:
+        st.session_state["pending_delete_batch_id"] = None
+    if "selected_batch_ids" not in st.session_state:
+        st.session_state["selected_batch_ids"] = []
+    if "pending_delete_batch_ids" not in st.session_state:
+        st.session_state["pending_delete_batch_ids"] = []
+    if "batch_page" not in st.session_state:
+        st.session_state["batch_page"] = 1
+    if "jobs_page" not in st.session_state:
+        st.session_state["jobs_page"] = 1
 
 
 def load_jobs_db() -> list[dict]:
@@ -337,6 +369,64 @@ def find_duplicate_jobs(yaml_hash: str, jobs: list[dict]) -> list[dict]:
     return [job for job in jobs if get_job_yaml_hash(job) == yaml_hash]
 
 
+def parse_batch_items(file_text: str) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    for raw_line in file_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "," in line:
+            left, right = line.split(",", 1)
+        elif "\t" in line:
+            left, right = line.split("\t", 1)
+        else:
+            continue
+        item_id = left.strip()
+        item_value = right.strip()
+        if not item_id or not item_value:
+            continue
+        if item_id.lower() in {"id", "name"}:
+            continue
+        items.append((item_id, item_value))
+    return items
+
+
+def batch_groups(jobs: list[dict]) -> list[dict]:
+    grouped: dict[str, dict] = {}
+    for job in jobs:
+        batch_id = job.get("batch_id")
+        if not batch_id:
+            continue
+        if batch_id not in grouped:
+            grouped[batch_id] = {
+                "batch_id": batch_id,
+                "batch_name": job.get("batch_name", batch_id),
+                "created_at": job.get("created_at", ""),
+                "updated_at": job.get("updated_at", ""),
+                "jobs": [],
+            }
+        grouped[batch_id]["jobs"].append(job)
+        if job.get("updated_at", "") > grouped[batch_id]["updated_at"]:
+            grouped[batch_id]["updated_at"] = job.get("updated_at", "")
+    result = []
+    for group in grouped.values():
+        counts = {status: 0 for status in JOB_STATUS_ORDER}
+        for job in group["jobs"]:
+            counts[job.get("status", "queued")] = counts.get(job.get("status", "queued"), 0) + 1
+        group["counts"] = counts
+        group["total"] = len(group["jobs"])
+        if counts.get("running", 0) > 0:
+            group["status"] = "running"
+        elif counts.get("queued", 0) > 0:
+            group["status"] = "queued"
+        elif counts.get("failed", 0) > 0:
+            group["status"] = "failed"
+        else:
+            group["status"] = "completed"
+        result.append(group)
+    return sorted(result, key=lambda g: g.get("updated_at", ""), reverse=True)
+
+
 def store_input_yaml_snapshot(cache_dir: str, yaml_hash: str, yaml_text: str) -> None:
     repo = Path(cache_dir) / INPUT_REPOSITORY_DIRNAME
     repo.mkdir(parents=True, exist_ok=True)
@@ -444,6 +534,21 @@ def add_entity() -> None:
     st.session_state["entities"].append(default_entity("protein"))
 
 
+def on_batch_mode_change() -> None:
+    # Reset entity editor to a blank default when switching batch mode.
+    st.session_state["entities"] = [default_entity("protein")]
+    st.session_state["batch_text_input"] = ""
+    for key in list(st.session_state.keys()):
+        if key.startswith("entity_"):
+            del st.session_state[key]
+    st.session_state["entity_type_0"] = "protein"
+    st.session_state["entity_copies_0"] = 1
+    st.session_state["entity_input_0"] = ""
+    st.session_state["entity_affinity_0"] = False
+    st.session_state["entity_cyclic_0"] = False
+    st.session_state["entity_ion_choice_0"] = "None"
+
+
 def load_example_entities() -> None:
     example_entities = [
         {
@@ -471,6 +576,49 @@ def load_example_entities() -> None:
         st.session_state[f"entity_affinity_{idx}"] = bool(entity["use_affinity"])
         st.session_state[f"entity_cyclic_{idx}"] = bool(entity["cyclic"])
         st.session_state[f"entity_ion_choice_{idx}"] = entity["ion_choice"]
+
+
+def load_batch_example(batch_mode: str) -> None:
+    # Batch scaffold: fixed target sequence only (no default ligand entity).
+    batch_scaffold = [
+        {
+            "type": "protein",
+            "copies": 1,
+            "input": EXAMPLE_PROTEIN,
+            "use_affinity": False,
+            "cyclic": False,
+            "ion_choice": "None",
+        }
+    ]
+    st.session_state["entities"] = batch_scaffold
+    st.session_state["entity_type_0"] = "protein"
+    st.session_state["entity_copies_0"] = 1
+    st.session_state["entity_input_0"] = EXAMPLE_RBDWT if batch_mode == "batch_sequences" else EXAMPLE_PROTEIN
+    st.session_state["entity_affinity_0"] = False
+    st.session_state["entity_cyclic_0"] = False
+    st.session_state["entity_ion_choice_0"] = "None"
+    if batch_mode == "batch_sequences":
+        st.session_state["batch_text_input"] = (
+            "LCB1,DKEWILQKIYEIMRLLDELGHAEASMRVSDLIYEFMKKGDERLLEEAERLLEEVER\n"
+            "LCB3,NDDELHMLMTDLVYEALHFAKDEEIKKRVFQLFELADKAYKNNDRQKLEKVVEELKELLERLLS\n"
+            "LCB8,PIIELLREAKEKNDEFAISDALYLVNELLQRTGDPRLEEVLYLIWRALKEKDPRLLDRAIELFER"
+        )
+    else:
+        st.session_state["batch_text_input"] = (
+            "LIG_001,OC1=C(I)C=C(OC2=C(I)C=C(C[C@H](N)C(O)=O)C=C2I)C=C1\n"
+            "LIG_002,CC(=O)OC1=CC=CC=C1C(=O)O\n"
+            "LIG_003,CN1CCC[C@H]1C2=CN=CC=C2"
+        )
+
+
+def load_context_example(batch_mode: str) -> None:
+    if batch_mode == "batch_ligands":
+        load_batch_example("batch_ligands")
+        return
+    if batch_mode == "batch_sequences":
+        load_batch_example("batch_sequences")
+        return
+    load_example_entities()
 
 
 def move_entity(index: int, delta: int) -> None:
@@ -522,7 +670,17 @@ def entities_for_run() -> list[dict]:
     return payload
 
 
-def queue_job(job_name: str, entities: list[dict], settings: dict, input_hash: str | None = None) -> str:
+def queue_job(
+    job_name: str,
+    entities: list[dict],
+    settings: dict,
+    input_hash: str | None = None,
+    *,
+    batch_id: str | None = None,
+    batch_name: str | None = None,
+    batch_item_id: str | None = None,
+    batch_role: str | None = None,
+) -> str:
     jobs = load_jobs_db()
     job_id = str(uuid.uuid4())
     now = utc_now()
@@ -530,6 +688,9 @@ def queue_job(job_name: str, entities: list[dict], settings: dict, input_hash: s
     safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", job_name).strip("_") or "job"
     run_name = safe_name[:30]
     display_name = f"{timestamp_label}_{run_name}"
+    # Use the displayed timestamped job name for execution as well, so
+    # result folder naming stays in sync with table naming.
+    run_name = display_name
     jobs.append(
         {
             "id": job_id,
@@ -541,6 +702,10 @@ def queue_job(job_name: str, entities: list[dict], settings: dict, input_hash: s
             "entities": entities,
             "settings": settings,
             "input_hash": input_hash,
+            "batch_id": batch_id,
+            "batch_name": batch_name,
+            "batch_item_id": batch_item_id,
+            "batch_role": batch_role,
             "result": None,
             "error": None,
         }
@@ -624,6 +789,24 @@ def remove_selected_jobs(job_ids: list[str], cache_dir: str, results_dir: str) -
         else:
             errors.append(msg)
     return removed, errors
+
+
+def remove_batch_jobs(batch_id: str, cache_dir: str, results_dir: str) -> tuple[int, list[str]]:
+    jobs = load_jobs_db()
+    batch_job_ids = [j["id"] for j in jobs if j.get("batch_id") == batch_id]
+    if not batch_job_ids:
+        return 0, [f"No persisted jobs found for batch {batch_id}."]
+    return remove_selected_jobs(batch_job_ids, cache_dir, results_dir)
+
+
+def remove_selected_batches(batch_ids: list[str], cache_dir: str, results_dir: str) -> tuple[int, list[str]]:
+    total_removed = 0
+    all_errors: list[str] = []
+    for batch_id in batch_ids:
+        removed, errors = remove_batch_jobs(batch_id, cache_dir, results_dir)
+        total_removed += removed
+        all_errors.extend(errors)
+    return total_removed, all_errors
 
 
 def process_next_job() -> tuple[bool, str]:
@@ -717,6 +900,227 @@ def deselect_all_filtered_jobs(job_ids: list[str]) -> None:
     st.session_state["selected_job_ids"] = list(selected)
 
 
+def select_all_filtered_batches(batch_ids: list[str]) -> None:
+    selected = set(st.session_state.get("selected_batch_ids", []))
+    for batch_id in batch_ids:
+        selected.add(batch_id)
+        st.session_state[f"batch_select_{batch_id}"] = True
+    st.session_state["selected_batch_ids"] = list(selected)
+
+
+def deselect_all_filtered_batches(batch_ids: list[str]) -> None:
+    selected = set(st.session_state.get("selected_batch_ids", []))
+    for batch_id in batch_ids:
+        selected.discard(batch_id)
+        st.session_state[f"batch_select_{batch_id}"] = False
+    st.session_state["selected_batch_ids"] = list(selected)
+
+
+def merged_metrics_for_job(job: dict) -> dict:
+    result = job.get("result") or {}
+    metrics = dict(result.get("metrics") or {})
+    job_dir = result.get("job_dir")
+    if job_dir and Path(job_dir).exists():
+        try:
+            files = find_confidence_files(job_dir)
+            live_metrics = collect_metrics(files.get("json_files") or [])
+            if isinstance(live_metrics, dict):
+                metrics.update(live_metrics)
+        except Exception:
+            pass
+    return metrics
+
+
+def build_results_zip_bytes(job_dir: str) -> bytes:
+    root = Path(job_dir)
+    if not root.exists():
+        return b""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for path in root.rglob("*"):
+            if path.is_file():
+                zf.write(path, arcname=str(path.relative_to(root)))
+    return buf.getvalue()
+
+
+def build_ligand_batch_summary_rows(members: list[dict]) -> list[dict]:
+    rows: list[dict] = []
+    metric_keys: set[str] = set()
+    for job in members:
+        metrics = merged_metrics_for_job(job)
+        metric_keys.update(metrics.keys())
+
+    for job in members:
+        metrics = merged_metrics_for_job(job)
+        affinity = metrics.get("affinity")
+        binding_probability = metrics.get("binding_probability")
+        ptm = metrics.get("ptm")
+        row = {
+            "item_id": job.get("batch_item_id") or job.get("name", ""),
+            "job_name": job.get("name", ""),
+            "status": job.get("status", ""),
+            "updated_at": job.get("updated_at", ""),
+            "ptm": ptm if isinstance(ptm, (int, float)) else None,
+        }
+        for mk in metric_keys:
+            value = metrics.get(mk)
+            row[mk] = value if isinstance(value, (int, float, str)) or value is None else str(value)
+        if isinstance(binding_probability, (int, float)):
+            row["binding_probability"] = float(binding_probability)
+        if isinstance(affinity, (int, float)):
+            row["affinity"] = float(affinity)
+            row["ic50_uM"] = float(10**affinity)
+            row["pIC50"] = float(6 - affinity)
+        rows.append(row)
+
+    def sort_key(r: dict):
+        # Lower affinity value indicates stronger binder for this model.
+        if isinstance(r.get("affinity"), (int, float)):
+            return (0, float(r["affinity"]))
+        return (1, r.get("job_name", ""))
+
+    rows.sort(key=sort_key)
+    return rows
+
+
+def get_cached_ligand_batch_summary(batch_id: str, members: list[dict]) -> list[dict]:
+    if "batch_summary_cache" not in st.session_state:
+        st.session_state["batch_summary_cache"] = {}
+    cache: dict = st.session_state["batch_summary_cache"]
+    signature = tuple(sorted((j.get("id", ""), j.get("status", ""), j.get("updated_at", "")) for j in members))
+    entry = cache.get(batch_id)
+    if entry and entry.get("signature") == signature:
+        return entry.get("rows", [])
+    rows = build_ligand_batch_summary_rows(members)
+    cache[batch_id] = {"signature": signature, "rows": rows}
+    st.session_state["batch_summary_cache"] = cache
+    return rows
+
+
+def render_ligand_batch_summary(batch_id: str, members: list[dict]) -> list[dict]:
+    if not members:
+        return []
+    batch_role = members[0].get("batch_role")
+    rows = get_cached_ligand_batch_summary(batch_id, members)
+    if not rows:
+        return []
+    title = "Batch Summary (Ligands)" if batch_role == "ligand" else "Batch Summary (Sequences)"
+    st.markdown(f"**{title}**")
+    st.caption("Use search/filter/sort to organize the batch table.")
+
+    controls = st.columns([2, 2, 2, 1])
+    search_query = controls[0].text_input(
+        "Search rows",
+        value="",
+        key=f"batch_summary_search_{batch_id}",
+        placeholder="item_id or job_name",
+    ).strip().lower()
+    status_options = sorted({str(r.get("status", "")) for r in rows if r.get("status")})
+    status_filter = controls[1].multiselect(
+        "Status filter",
+        options=status_options,
+        default=status_options,
+        key=f"batch_summary_status_{batch_id}",
+    )
+    preferred_cols = [
+        "item_id",
+        "job_name",
+        "status",
+        "updated_at",
+        # Local structural
+        "complex_plddt",
+        "complex_pde",
+        # Global
+        "ptm",
+        "confidence_score",
+        # Interface
+        "iptm",
+        "ligand_iptm",
+        "protein_iptm",
+        "complex_iplddt",
+        "complex_ipde",
+        # Affinity (shown only when present)
+        "affinity",
+        "ic50_uM",
+        "binding_probability",
+    ]
+    # Keep only curated columns to avoid clutter; include key if present in any row.
+    ordered_cols = [c for c in preferred_cols if any(c in r and r.get(c) is not None for r in rows)]
+    # Always keep identity columns even if values are empty.
+    for id_col in ("item_id", "job_name", "status", "updated_at"):
+        if id_col not in ordered_cols and any(id_col in r for r in rows):
+            ordered_cols.insert(min(len(ordered_cols), ("item_id", "job_name", "status", "updated_at").index(id_col)), id_col)
+    sort_options = [c for c in ordered_cols if c not in {"item_id", "job_name"}]
+    effective_sort_options = sort_options or ["updated_at"]
+    if batch_role == "ligand" and "affinity" in effective_sort_options:
+        default_sort_field = "affinity"
+        default_sort_desc = False  # lower affinity value means stronger binder
+    elif batch_role == "sequence" and "iptm" in effective_sort_options:
+        default_sort_field = "iptm"
+        default_sort_desc = True
+    else:
+        default_sort_field = "updated_at" if "updated_at" in effective_sort_options else effective_sort_options[0]
+        default_sort_desc = True
+    default_sort_index = effective_sort_options.index(default_sort_field)
+    sort_field = controls[2].selectbox(
+        "Sort by",
+        options=effective_sort_options,
+        key=f"batch_summary_sort_field_{batch_id}",
+        index=default_sort_index,
+    )
+    sort_desc = controls[3].checkbox(
+        "Desc",
+        value=default_sort_desc,
+        key=f"batch_summary_sort_desc_{batch_id}",
+    )
+
+    filtered_rows = []
+    for row in rows:
+        if status_filter and str(row.get("status", "")) not in status_filter:
+            continue
+        if search_query:
+            hay = f"{row.get('item_id', '')} {row.get('job_name', '')}".lower()
+            if search_query not in hay:
+                continue
+        filtered_rows.append(row)
+
+    def _sort_key(row: dict):
+        value = row.get(sort_field)
+        if isinstance(value, (int, float)):
+            return (0, float(value))
+        if value is None:
+            return (1, "")
+        return (1, str(value))
+
+    filtered_rows.sort(key=_sort_key, reverse=sort_desc)
+    ordered_rows = [{k: row.get(k) for k in ordered_cols} for row in filtered_rows]
+
+    st.dataframe(
+        ordered_rows,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "item_id": st.column_config.TextColumn("item_id"),
+            "job_name": st.column_config.TextColumn("job_name"),
+            "status": st.column_config.TextColumn("status"),
+            "updated_at": st.column_config.TextColumn("updated_at"),
+            "complex_plddt": st.column_config.NumberColumn("complex_plddt", format="%.3f", help=METRIC_HELP.get("complex_plddt")),
+            "complex_pde": st.column_config.NumberColumn("complex_pde", format="%.3f", help=METRIC_HELP.get("complex_pde")),
+            "ptm": st.column_config.NumberColumn("ptm", format="%.3f", help=METRIC_HELP.get("ptm")),
+            "confidence_score": st.column_config.NumberColumn("confidence_score", format="%.3f", help=METRIC_HELP.get("confidence_score")),
+            "iptm": st.column_config.NumberColumn("iptm", format="%.3f", help=METRIC_HELP.get("iptm")),
+            "ligand_iptm": st.column_config.NumberColumn("ligand_iptm", format="%.3f", help=METRIC_HELP.get("ligand_iptm")),
+            "protein_iptm": st.column_config.NumberColumn("protein_iptm", format="%.3f", help=METRIC_HELP.get("protein_iptm")),
+            "complex_iplddt": st.column_config.NumberColumn("complex_iplddt", format="%.3f", help=METRIC_HELP.get("complex_iplddt")),
+            "complex_ipde": st.column_config.NumberColumn("complex_ipde", format="%.3f", help=METRIC_HELP.get("complex_ipde")),
+            "affinity": st.column_config.NumberColumn("affinity", format="%.3f", help=METRIC_HELP.get("affinity")),
+            "ic50_uM": st.column_config.NumberColumn("ic50_uM", format="%.4g", help=METRIC_HELP.get("ic50_uM")),
+            "binding_probability": st.column_config.NumberColumn("binding_probability", format="%.3f", help=METRIC_HELP.get("binding_probability")),
+        },
+    )
+    return filtered_rows
+
+
 def render_result_view(job_record: dict) -> None:
     result = job_record.get("result") or {}
     st.subheader(job_record["name"])
@@ -737,25 +1141,46 @@ def render_result_view(job_record: dict) -> None:
     job_dir = result.get("job_dir")
     if job_dir:
         st.code(f"Result folder: {job_dir}")
-    metrics = result.get("metrics") or {}
+    metrics = merged_metrics_for_job(job_record)
     if metrics:
-        display_metrics = dict(metrics)
+        # Curated metrics order: local structural -> global -> interface -> affinity.
+        ordered_keys = [
+            "complex_plddt",   # local structural confidence
+            "complex_pde",     # local structural error (A)
+            "ptm",             # global topology confidence
+            "confidence_score",
+            "iptm",            # interface confidence
+            "ligand_iptm",
+            "protein_iptm",
+            "complex_iplddt",
+            "complex_ipde",
+            "affinity",        # affinity output
+            "binding_probability",
+        ]
+        display_metrics = {}
+        for key in ordered_keys:
+            if key in metrics and isinstance(metrics[key], (int, float)):
+                display_metrics[key] = metrics[key]
         affinity_value = display_metrics.get("affinity")
         if isinstance(affinity_value, (int, float)):
             display_metrics["ic50_uM"] = float(10**affinity_value)
-            display_metrics["pIC50"] = float(6 - affinity_value)
-            display_metrics["affinity_kcalmol_eq"] = float((6 - affinity_value) * 1.364)
-        metric_columns = st.columns(min(4, max(1, len(display_metrics))))
-        for index, (key, value) in enumerate(display_metrics.items()):
-            if key == "binding_probability":
-                display = f"{value:.2%}"
-            elif key == "ic50_uM":
-                display = f"{value:.3g} µM"
-            elif isinstance(value, (int, float)):
-                display = f"{value:.2f}"
-            else:
-                display = str(value)
-            metric_columns[index % len(metric_columns)].metric(key, display)
+
+        if display_metrics:
+            metric_columns = st.columns(min(4, max(1, len(display_metrics))))
+            for index, (key, value) in enumerate(display_metrics.items()):
+                if key == "binding_probability":
+                    display = f"{value:.2%}"
+                elif key == "ic50_uM":
+                    display = f"{value:.3g} µM"
+                elif isinstance(value, (int, float)):
+                    display = f"{value:.2f}"
+                else:
+                    display = str(value)
+                metric_columns[index % len(metric_columns)].metric(
+                    f"{key}",
+                    display,
+                    help=METRIC_HELP.get(key, ""),
+                )
 
     structure_path = result.get("structure_path")
     if structure_path and Path(structure_path).exists():
@@ -770,11 +1195,11 @@ def render_result_view(job_record: dict) -> None:
             use_container_width=True,
         )
     if job_dir and Path(job_dir).exists():
-        archive_path = Path(shutil.make_archive(job_dir, "zip", root_dir=job_dir))
+        archive_bytes = build_results_zip_bytes(job_dir)
         st.download_button(
             "Download full results",
-            data=archive_path.read_bytes(),
-            file_name=archive_path.name,
+            data=archive_bytes,
+            file_name=f"{Path(job_dir).name}.zip",
             mime="application/zip",
             use_container_width=True,
         )
@@ -861,7 +1286,7 @@ if "input_hash_backfill_done" not in st.session_state:
     st.session_state["input_hash_backfill_done"] = True
     st.session_state["input_hash_backfill_count"] = updated_hash_count
 
-if st.session_state["nav_page"] != "Job Details":
+if st.session_state["nav_page"] == "New Job":
     if "jobs_flash" in st.session_state:
         flash_msg = st.session_state.pop("jobs_flash")
         if flash_msg.startswith("Delete failed:"):
@@ -875,6 +1300,52 @@ if st.session_state["nav_page"] != "Job Details":
         )
 
     st.text_input("Job name", key="job_name", placeholder="example: insulin_test_01")
+
+    st.subheader("Batch Mode")
+    batch_mode = st.selectbox(
+        "Batch input type",
+        ["none", "batch_ligands", "batch_sequences"],
+        format_func=lambda x: {
+            "none": "None (single run)",
+            "batch_ligands": "Batch ligands (ID,SMILES)",
+            "batch_sequences": "Batch sequences (ID,SEQUENCE)",
+        }[x],
+        key="batch_mode",
+    )
+    batch_file = None
+    batch_items: list[tuple[str, str]] = []
+    if st.session_state.get("last_batch_mode") != batch_mode:
+        on_batch_mode_change()
+        st.session_state["last_batch_mode"] = batch_mode
+        st.rerun()
+    else:
+        st.session_state["last_batch_mode"] = batch_mode
+    if batch_mode != "none":
+        batch_text = st.text_area(
+            "Batch text input (ID,VALUE)",
+            key="batch_text_input",
+            height=120,
+            placeholder="LIG_001,CC(=O)OC1=CC=CC=C1C(=O)O",
+        )
+        batch_file = st.file_uploader(
+            "Upload batch file (.txt/.csv)",
+            type=["txt", "csv", "tsv"],
+            key="batch_file",
+            help="Each line: ID,VALUE",
+        )
+        if batch_text.strip():
+            batch_items = parse_batch_items(batch_text)
+        elif batch_file is not None:
+            try:
+                text = batch_file.getvalue().decode("utf-8", errors="ignore")
+            except Exception:
+                text = ""
+            batch_items = parse_batch_items(text)
+            if batch_items:
+                st.caption(f"Parsed {len(batch_items)} batch item(s).")
+            else:
+                st.warning("No valid batch rows parsed. Expected lines like: ID,VALUE")
+
     st.subheader("Entities")
     for idx, entity in enumerate(st.session_state["entities"]):
         with st.container(border=True):
@@ -914,7 +1385,7 @@ if st.session_state["nav_page"] != "Job Details":
     with b1:
         st.button("Add entity", on_click=add_entity, use_container_width=True)
     with b2:
-        st.button("Load example", on_click=load_example_entities, use_container_width=True)
+        st.button("Load example", on_click=load_context_example, args=(batch_mode,), use_container_width=True)
 
     sync_entity_inputs()
     effective_entities = entities_for_run()
@@ -953,13 +1424,84 @@ if st.session_state["nav_page"] != "Job Details":
         if not ok_entities:
             st.error(parse_message)
         else:
+            preview_entities = deepcopy(normalized_entities)
+            preview_sequence = first_protein_sequence or ""
+            if batch_mode == "batch_ligands" and batch_items:
+                first_batch_smiles = batch_items[0][1]
+                ligand_idx = next((i for i, e in enumerate(preview_entities) if e["type"] == "ligand"), None)
+                if ligand_idx is not None:
+                    preview_entities[ligand_idx]["input"] = first_batch_smiles
+                else:
+                    preview_entities.append(
+                        {
+                            "type": "ligand",
+                            "copies": 1,
+                            "input": first_batch_smiles,
+                            "use_affinity": True,
+                            "cyclic": False,
+                        }
+                    )
+            elif batch_mode == "batch_sequences" and batch_items:
+                first_batch_seq = batch_items[0][1]
+                preview_entities.append(
+                    {
+                        "type": "protein",
+                        "copies": 1,
+                        "input": first_batch_seq,
+                        "use_affinity": False,
+                        "cyclic": False,
+                    }
+                )
+                preview_sequence = first_protein_sequence or ""
             yaml_preview = build_boltz_yaml_text(
-                sequence=first_protein_sequence or "",
-                entities=normalized_entities,
+                sequence=preview_sequence,
+                entities=preview_entities,
                 msa_path=yaml_msa_path,
                 enable_affinity=runtime_settings["enable_affinity"],
             )
             st.code(yaml_preview, language="yaml")
+            if batch_mode != "none" and batch_items:
+                st.caption(f"Batch will generate {len(batch_items)} YAML/job inputs.")
+                with st.expander("Show first batch YAMLs", expanded=False):
+                    max_preview = min(5, len(batch_items))
+                    for idx in range(max_preview):
+                        item_id, item_value = batch_items[idx]
+                        entities_item = deepcopy(normalized_entities)
+                        seq_item = first_protein_sequence or ""
+                        if batch_mode == "batch_ligands":
+                            lig_idx = next((i for i, e in enumerate(entities_item) if e["type"] == "ligand"), None)
+                            if lig_idx is None:
+                                entities_item.append(
+                                    {
+                                        "type": "ligand",
+                                        "copies": 1,
+                                        "input": item_value,
+                                        "use_affinity": True,
+                                        "cyclic": False,
+                                    }
+                                )
+                            else:
+                                entities_item[lig_idx]["input"] = item_value
+                                entities_item[lig_idx]["use_affinity"] = True
+                        else:
+                            entities_item.append(
+                                {
+                                    "type": "protein",
+                                    "copies": 1,
+                                    "input": item_value,
+                                    "use_affinity": False,
+                                    "cyclic": False,
+                                }
+                            )
+                            seq_item = first_protein_sequence or ""
+                        yaml_item = build_boltz_yaml_text(
+                            sequence=seq_item,
+                            entities=entities_item,
+                            msa_path=yaml_msa_path,
+                            enable_affinity=runtime_settings["enable_affinity"],
+                        )
+                        st.markdown(f"**{idx + 1}. {item_id}**")
+                        st.code(yaml_item, language="yaml")
 
     # Real-time duplicate detection (same behavior style as MSA presence check).
     candidate_hash_live = None
@@ -990,39 +1532,101 @@ if st.session_state["nav_page"] != "Job Details":
             st.error("Job name is required.")
         elif not ok_entities:
             st.error(parse_message)
+        elif batch_mode != "none" and not batch_items:
+            st.error("Batch mode selected, but no valid batch items were found.")
         else:
-            candidate_yaml = build_boltz_yaml_text(
-                sequence=first_protein_sequence or "",
-                entities=normalized_entities,
-                msa_path=None,
-                enable_affinity=runtime_settings["enable_affinity"],
-            )
-            candidate_hash = candidate_hash_live or compute_yaml_hash(candidate_yaml)
-            all_known_jobs = all_jobs_with_legacy(runtime_settings["results_dir"])
-            duplicates = find_duplicate_jobs(candidate_hash, all_known_jobs)
-            if duplicates:
-                st.warning(
-                    f"Identical input already exists in {len(duplicates)} job(s). "
-                    "Submitting new job anyway."
+            base_name = st.session_state["job_name"].strip()
+            if batch_mode == "none":
+                candidate_yaml = build_boltz_yaml_text(
+                    sequence=first_protein_sequence or "",
+                    entities=normalized_entities,
+                    msa_path=None,
+                    enable_affinity=runtime_settings["enable_affinity"],
                 )
-                with st.expander("Show matching jobs", expanded=False):
-                    for dup in duplicates:
-                        st.caption(
-                            f"- {dup['name']} | {dup.get('status', 'unknown')} | {dup.get('updated_at', '-')}"
-                        )
-            store_input_yaml_snapshot(runtime_settings["cache_dir"], candidate_hash, candidate_yaml)
-            job_id = queue_job(
-                st.session_state["job_name"].strip(),
-                normalized_entities,
-                runtime_settings,
-                input_hash=candidate_hash,
-            )
-            spawned_worker = start_worker_if_needed()
-            if spawned_worker:
-                st.success(f"Job queued: {job_id}. Background worker started.")
+                candidate_hash = candidate_hash_live or compute_yaml_hash(candidate_yaml)
+                all_known_jobs = all_jobs_with_legacy(runtime_settings["results_dir"])
+                duplicates = find_duplicate_jobs(candidate_hash, all_known_jobs)
+                if duplicates:
+                    st.warning(
+                        f"Identical input already exists in {len(duplicates)} job(s). "
+                        "Submitting new job anyway."
+                    )
+                    with st.expander("Show matching jobs", expanded=False):
+                        for dup in duplicates:
+                            st.caption(
+                                f"- {dup['name']} | {dup.get('status', 'unknown')} | {dup.get('updated_at', '-')}"
+                            )
+                store_input_yaml_snapshot(runtime_settings["cache_dir"], candidate_hash, candidate_yaml)
+                job_id = queue_job(
+                    base_name,
+                    normalized_entities,
+                    runtime_settings,
+                    input_hash=candidate_hash,
+                )
+                spawned_worker = start_worker_if_needed()
+                if spawned_worker:
+                    st.success(f"Job queued: {job_id}. Background worker started.")
+                else:
+                    st.success(f"Job queued: {job_id}.")
+                st.info(f"Input hash: {candidate_hash}")
             else:
-                st.success(f"Job queued: {job_id}.")
-            st.info(f"Input hash: {candidate_hash}")
+                batch_id = str(uuid.uuid4())
+                batch_role = "ligand" if batch_mode == "batch_ligands" else "sequence"
+                queued_ids: list[str] = []
+                for item_id, item_value in batch_items:
+                    entities_item = deepcopy(normalized_entities)
+                    if batch_role == "ligand":
+                        ligand_idx = next((i for i, e in enumerate(entities_item) if e["type"] == "ligand"), None)
+                        if ligand_idx is None:
+                            entities_item.append(
+                                {
+                                    "type": "ligand",
+                                    "copies": 1,
+                                    "input": item_value,
+                                    "use_affinity": True,
+                                    "cyclic": False,
+                                }
+                            )
+                        else:
+                            entities_item[ligand_idx]["input"] = item_value
+                            entities_item[ligand_idx]["use_affinity"] = True
+                    else:
+                        entities_item.append(
+                            {
+                                "type": "protein",
+                                "copies": 1,
+                                "input": item_value,
+                                "use_affinity": False,
+                                "cyclic": False,
+                            }
+                        )
+                    sequence_for_hash = next((e["input"] for e in entities_item if e["type"] == "protein"), "")
+                    candidate_yaml = build_boltz_yaml_text(
+                        sequence=sequence_for_hash,
+                        entities=entities_item,
+                        msa_path=None,
+                        enable_affinity=runtime_settings["enable_affinity"],
+                    )
+                    candidate_hash = compute_yaml_hash(candidate_yaml)
+                    store_input_yaml_snapshot(runtime_settings["cache_dir"], candidate_hash, candidate_yaml)
+                    job_id = queue_job(
+                        f"{base_name}_{item_id}",
+                        entities_item,
+                        runtime_settings,
+                        input_hash=candidate_hash,
+                        batch_id=batch_id,
+                        batch_name=base_name,
+                        batch_item_id=item_id,
+                        batch_role=batch_role,
+                    )
+                    queued_ids.append(job_id)
+                spawned_worker = start_worker_if_needed()
+                if queued_ids:
+                    st.success(f"Queued {len(queued_ids)} batch job(s). Batch ID: {batch_id}")
+                    if spawned_worker:
+                        st.caption("Background worker started.")
+                else:
+                    st.error("No batch jobs were queued. Ensure the matching entity type exists in Entities.")
 
     st.subheader("Queue Summary")
     jobs = all_jobs_with_legacy(runtime_settings["results_dir"])
@@ -1037,6 +1641,120 @@ if st.session_state["nav_page"] != "Job Details":
     st.caption(f"Queue worker: {'running' if is_worker_running() else 'idle'}")
 
     st.subheader("Recent Jobs")
+    grouped_batches = batch_groups(jobs)
+    if grouped_batches:
+        st.subheader("Batch Runs")
+        BATCHES_PER_PAGE = 5
+        total_batches = len(grouped_batches)
+        total_batch_pages = max(1, (total_batches + BATCHES_PER_PAGE - 1) // BATCHES_PER_PAGE)
+        current_batch_page = int(st.session_state.get("batch_page", 1))
+        current_batch_page = max(1, min(current_batch_page, total_batch_pages))
+        st.session_state["batch_page"] = current_batch_page
+        start_batch_idx = (current_batch_page - 1) * BATCHES_PER_PAGE
+        end_batch_idx = start_batch_idx + BATCHES_PER_PAGE
+        visible_batches = grouped_batches[start_batch_idx:end_batch_idx]
+
+        bp1, bp2, bp3 = st.columns([1, 2, 1])
+        with bp1:
+            if st.button("Previous batches", use_container_width=True, disabled=current_batch_page <= 1):
+                st.session_state["batch_page"] = current_batch_page - 1
+                st.rerun()
+        with bp2:
+            st.caption(f"Batch page {current_batch_page}/{total_batch_pages} ({total_batches} total)")
+        with bp3:
+            if st.button("Next batches", use_container_width=True, disabled=current_batch_page >= total_batch_pages):
+                st.session_state["batch_page"] = current_batch_page + 1
+                st.rerun()
+
+        batch_ids_visible = [b["batch_id"] for b in visible_batches]
+        batch_actions_c1, batch_actions_c2 = st.columns(2)
+        with batch_actions_c1:
+            st.button(
+                "Select all batches",
+                use_container_width=True,
+                on_click=select_all_filtered_batches,
+                args=(batch_ids_visible,),
+                disabled=not batch_ids_visible,
+            )
+        with batch_actions_c2:
+            st.button(
+                "Deselect all batches",
+                use_container_width=True,
+                on_click=deselect_all_filtered_batches,
+                args=(batch_ids_visible,),
+                disabled=not batch_ids_visible,
+            )
+
+        selected_batches_now = set(st.session_state.get("selected_batch_ids", []))
+        for batch in visible_batches:
+            cols = st.columns([0.7, 4, 2, 2, 2, 1])
+            is_selected = batch["batch_id"] in selected_batches_now
+            cols[0].checkbox(
+                "Select batch",
+                value=is_selected,
+                key=f"batch_select_{batch['batch_id']}",
+                label_visibility="collapsed",
+            )
+            if st.session_state.get(f"batch_select_{batch['batch_id']}", False):
+                selected_batches_now.add(batch["batch_id"])
+            else:
+                selected_batches_now.discard(batch["batch_id"])
+            cols[1].write(f"**{batch['batch_name']}**")
+            cols[2].write(batch["status"])
+            cols[3].write(f"{batch['total']} jobs")
+            cols[4].write(batch.get("updated_at", "-"))
+            if cols[5].button("Open", key=f"open_batch_{batch['batch_id']}"):
+                st.session_state["selected_batch_id"] = batch["batch_id"]
+                st.session_state["nav_page"] = "Batch Details"
+                st.rerun()
+            st.caption(
+                f"queued={batch['counts'].get('queued',0)} | running={batch['counts'].get('running',0)} | "
+                f"completed={batch['counts'].get('completed',0)} | failed={batch['counts'].get('failed',0)}"
+            )
+        st.session_state["selected_batch_ids"] = list(selected_batches_now)
+
+        st.button(
+            "Delete selected batches",
+            type="secondary",
+            use_container_width=True,
+            disabled=not st.session_state.get("selected_batch_ids", []),
+            on_click=lambda: st.session_state.update(
+                {"pending_delete_batch_ids": list(st.session_state.get("selected_batch_ids", []))}
+            ),
+        )
+
+        pending_batch_ids = list(st.session_state.get("pending_delete_batch_ids", []))
+        if pending_batch_ids:
+            pending_batches = [b for b in grouped_batches if b["batch_id"] in set(pending_batch_ids)]
+            st.warning("Delete selected batches?")
+            for pb in pending_batches:
+                st.write(f"- {pb['batch_name']} ({pb['total']} jobs, {pb['status']})")
+            d1, d2 = st.columns(2)
+            with d1:
+                if st.button("Confirm selected batch delete", type="primary", use_container_width=True):
+                    removed_count, errors = remove_selected_batches(
+                        pending_batch_ids,
+                        runtime_settings["cache_dir"],
+                        runtime_settings["results_dir"],
+                    )
+                    st.session_state["selected_batch_ids"] = [
+                        bid for bid in st.session_state.get("selected_batch_ids", []) if bid not in set(pending_batch_ids)
+                    ]
+                    st.session_state["pending_delete_batch_ids"] = []
+                    if removed_count:
+                        st.session_state["jobs_flash"] = f"Removed {removed_count} jobs from selected batches."
+                    if errors:
+                        st.session_state["jobs_flash"] = (
+                            st.session_state.get("jobs_flash", "")
+                            + ("; " if st.session_state.get("jobs_flash") else "")
+                            + f"Batch delete errors: {'; '.join(errors)}"
+                        )
+                    st.rerun()
+            with d2:
+                if st.button("Cancel selected batch delete", use_container_width=True):
+                    st.session_state["pending_delete_batch_ids"] = []
+                    st.rerun()
+
     inline_query = st.text_input("Search jobs", value="", key="landing_jobs_query")
     inline_status = st.multiselect(
         "Status",
@@ -1050,8 +1768,30 @@ if st.session_state["nav_page"] != "Job Details":
         if j["status"] in inline_status
         and (not inline_query.strip() or inline_query.lower().strip() in j["name"].lower())
     ]
-    filtered_inline = sorted(filtered_inline, key=lambda j: j.get("name", ""), reverse=True)[:12]
-    filtered_ids = [j["id"] for j in filtered_inline]
+    filtered_inline = sorted(filtered_inline, key=lambda j: j.get("name", ""), reverse=True)
+    JOBS_PER_PAGE = 15
+    total_filtered_jobs = len(filtered_inline)
+    total_job_pages = max(1, (total_filtered_jobs + JOBS_PER_PAGE - 1) // JOBS_PER_PAGE)
+    current_jobs_page = int(st.session_state.get("jobs_page", 1))
+    current_jobs_page = max(1, min(current_jobs_page, total_job_pages))
+    st.session_state["jobs_page"] = current_jobs_page
+    start_job_idx = (current_jobs_page - 1) * JOBS_PER_PAGE
+    end_job_idx = start_job_idx + JOBS_PER_PAGE
+    visible_jobs = filtered_inline[start_job_idx:end_job_idx]
+    filtered_ids = [j["id"] for j in visible_jobs]
+
+    jp1, jp2, jp3 = st.columns([1, 2, 1])
+    with jp1:
+        if st.button("Previous jobs", use_container_width=True, disabled=current_jobs_page <= 1):
+            st.session_state["jobs_page"] = current_jobs_page - 1
+            st.rerun()
+    with jp2:
+        st.caption(f"Job page {current_jobs_page}/{total_job_pages} ({total_filtered_jobs} filtered)")
+    with jp3:
+        if st.button("Next jobs", use_container_width=True, disabled=current_jobs_page >= total_job_pages):
+            st.session_state["jobs_page"] = current_jobs_page + 1
+            st.rerun()
+
     actions_c1, actions_c2 = st.columns(2)
     with actions_c1:
         st.button(
@@ -1071,10 +1811,10 @@ if st.session_state["nav_page"] != "Job Details":
         )
 
 
-    if not filtered_inline:
+    if not visible_jobs:
         st.caption("No jobs found.")
     selected_now = set(st.session_state.get("selected_job_ids", []))
-    for job in filtered_inline:
+    for job in visible_jobs:
         cols = st.columns([0.7, 4, 2, 2, 1])
         is_selected = job["id"] in selected_now
         cols[0].checkbox(
@@ -1092,6 +1832,7 @@ if st.session_state["nav_page"] != "Job Details":
         cols[3].write(job.get("updated_at", "-"))
         if cols[4].button("Open", key=f"landing_open_{job['id']}"):
             st.session_state["selected_job_id"] = job["id"]
+            st.session_state["job_return_page"] = "New Job"
             st.session_state["nav_page"] = "Job Details"
             st.rerun()
     st.session_state["selected_job_ids"] = list(selected_now)
@@ -1140,15 +1881,50 @@ if st.session_state["nav_page"] != "Job Details":
                 st.session_state["pending_delete_job_ids"] = []
                 st.rerun()
 
-else:
+elif st.session_state["nav_page"] == "Job Details":
     jobs = all_jobs_with_legacy(runtime_settings["results_dir"])
     selected_id = st.session_state.get("selected_job_id")
     job = next((j for j in jobs if j["id"] == selected_id), None)
     top_cols = st.columns([1, 4])
-    if top_cols[0].button("Back to New Job"):
-        st.session_state["nav_page"] = "New Job"
-        st.rerun()
+    if st.session_state.get("job_return_page") == "Batch Details" and st.session_state.get("selected_batch_id"):
+        if top_cols[0].button("Back to Batch"):
+            st.session_state["nav_page"] = "Batch Details"
+            st.rerun()
+    else:
+        if top_cols[0].button("Back to New Job"):
+            st.session_state["nav_page"] = "New Job"
+            st.rerun()
     if job is None:
         st.warning("No job selected.")
     else:
         render_result_view(job)
+else:
+    jobs = all_jobs_with_legacy(runtime_settings["results_dir"])
+    batch_id = st.session_state.get("selected_batch_id")
+    members = [j for j in jobs if j.get("batch_id") == batch_id]
+    top_cols = st.columns([1, 4])
+    if top_cols[0].button("Back to New Job"):
+        st.session_state["nav_page"] = "New Job"
+        st.rerun()
+    if not members:
+        st.warning("No batch selected.")
+    else:
+        members = sorted(members, key=lambda j: j.get("name", ""))
+        st.subheader(f"Batch: {members[0].get('batch_name', batch_id)}")
+        st.caption(f"Batch ID: {batch_id} • {len(members)} job(s)")
+        filtered_rows = render_ligand_batch_summary(batch_id, members)
+        member_by_id = {j.get("batch_item_id") or j.get("name", ""): j for j in members}
+        list_source = [member_by_id.get(r.get("item_id")) for r in filtered_rows] if filtered_rows else members
+        list_source = [j for j in list_source if j is not None]
+        st.markdown("**Batch Items**")
+        for job in list_source:
+            cols = st.columns([3, 2, 2, 1])
+            label = job.get("batch_item_id") or job["name"]
+            cols[0].write(f"**{label}**")
+            cols[1].write(job.get("status", "-"))
+            cols[2].write(job.get("updated_at", "-"))
+            if cols[3].button("Open", key=f"batch_member_open_{job['id']}"):
+                st.session_state["selected_job_id"] = job["id"]
+                st.session_state["job_return_page"] = "Batch Details"
+                st.session_state["nav_page"] = "Job Details"
+                st.rerun()
