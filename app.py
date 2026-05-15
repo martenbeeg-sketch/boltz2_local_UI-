@@ -39,6 +39,7 @@ from visualization import plot_pae, plot_plddt, viewer_html
 
 APP_DIR = Path(__file__).resolve().parent
 JOBS_DB_PATH = APP_DIR / "jobs_db.json"
+USER_SETTINGS_PATH = APP_DIR / "user_settings.json"
 INPUT_REPOSITORY_DIRNAME = "input_repository"
 WORKER_SCRIPT_PATH = APP_DIR / "queue_worker.py"
 WORKER_PID_PATH = APP_DIR / "queue_worker.pid"
@@ -79,6 +80,40 @@ METRIC_HELP = {
     "ic50_uM": "IC50 estimate derived from affinity, in micromolar (uM). Lower is better.",
     "binding_probability": "Predicted probability that ligand is a binder (0-1). Higher is better.",
 }
+
+PERSISTED_SETTING_DEFAULTS = {
+    "gpu_device": "0",
+    "docker_image": "ovoex-boltz2",
+    "cache_dir": DEFAULT_BOLTZ_CACHE_DIR,
+    "msa_repository_dir": DEFAULT_MSA_REPOSITORY_DIR,
+    "results_dir": str((APP_DIR / "results").resolve()),
+    "docker_args": "--ipc=host --shm-size=48G",
+    "use_msa_server": True,
+    "use_msa_repository": True,
+    "use_potentials": True,
+    "enable_affinity": True,
+    "sampling_steps": 200,
+    "recycling_steps": 3,
+    "diffusion_samples": 1,
+    "sampling_steps_affinity": 200,
+    "diffusion_samples_affinity": 5,
+    "affinity_mw_correction": False,
+}
+
+
+def load_user_settings() -> dict:
+    if not USER_SETTINGS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(USER_SETTINGS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_user_settings(settings: dict) -> None:
+    payload = {k: settings.get(k) for k in PERSISTED_SETTING_DEFAULTS}
+    USER_SETTINGS_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 EVENT_COMPONENT_JS = """
 export default function(component) {
@@ -233,6 +268,12 @@ def default_entity(entity_type: str = "protein") -> dict:
 
 
 def ensure_state() -> None:
+    if "settings_loaded" not in st.session_state:
+        persisted = load_user_settings()
+        for key, default in PERSISTED_SETTING_DEFAULTS.items():
+            st.session_state[key] = persisted.get(key, default)
+        st.session_state["settings_loaded"] = True
+
     if "entities" not in st.session_state:
         st.session_state["entities"] = [default_entity("protein")]
     if "job_name" not in st.session_state:
@@ -1226,34 +1267,30 @@ st.caption("Streamlit host UI that runs Boltz-2 through a Docker container.")
 
 with st.sidebar:
     st.subheader("Runtime")
-    gpu_device = st.selectbox("GPU device", options=["0", "1", "all"], index=0)
+    gpu_device = st.selectbox("GPU device", options=["0", "1", "all"], key="gpu_device")
     with st.expander("Settings", expanded=False):
-        docker_image = st.text_input("Docker image", value=st.session_state.get("docker_image", "ovoex-boltz2"), key="docker_image")
-        cache_dir = st.text_input("Cache directory", value=st.session_state.get("cache_dir", DEFAULT_BOLTZ_CACHE_DIR), key="cache_dir")
+        docker_image = st.text_input("Docker image", key="docker_image")
+        cache_dir = st.text_input("Cache directory", key="cache_dir")
         msa_repository_dir = st.text_input(
             "MSA repository directory",
-            value=st.session_state.get("msa_repository_dir", DEFAULT_MSA_REPOSITORY_DIR),
             key="msa_repository_dir",
         )
         results_dir = st.text_input(
             "Results directory",
-            value=st.session_state.get("results_dir", str((Path(__file__).resolve().parent / "results"))),
             key="results_dir",
         )
-        docker_args = st.text_input("Docker extra args", value=st.session_state.get("docker_args", "--ipc=host --shm-size=48G"), key="docker_args")
-    st.code(f"BOLTZ_DOCKER_IMAGE={docker_image}\nBOLTZ_CACHE_DIR={cache_dir}", language="bash")
-
+        docker_args = st.text_input("Docker extra args", key="docker_args")
     with st.expander("Boltz settings", expanded=False):
-        use_msa_server = st.checkbox("Use MSA", value=True)
-        use_msa_repository = st.checkbox("Use local MSA repository", value=True)
-        use_potentials = st.checkbox("Respect physics (use potentials)", value=True)
-        enable_affinity = st.checkbox("Enable affinity for ligand runs", value=True)
-        sampling_steps = st.number_input("Sampling steps", min_value=10, max_value=400, value=200, step=10)
-        recycling_steps = st.number_input("Recycling steps", min_value=1, max_value=12, value=3, step=1)
-        diffusion_samples = st.number_input("Diffusion samples", min_value=1, max_value=16, value=1, step=1)
-        sampling_steps_affinity = st.number_input("Affinity sampling steps", min_value=10, max_value=400, value=200, step=10)
-        diffusion_samples_affinity = st.number_input("Affinity diffusion samples", min_value=1, max_value=16, value=5, step=1)
-        affinity_mw_correction = st.checkbox("Affinity molecular-weight correction", value=False)
+        use_msa_server = st.checkbox("Use MSA", key="use_msa_server")
+        use_msa_repository = st.checkbox("Use local MSA repository", key="use_msa_repository")
+        use_potentials = st.checkbox("Respect physics (use potentials)", key="use_potentials")
+        enable_affinity = st.checkbox("Enable affinity for ligand runs", key="enable_affinity")
+        sampling_steps = st.number_input("Sampling steps", min_value=10, max_value=400, step=10, key="sampling_steps")
+        recycling_steps = st.number_input("Recycling steps", min_value=1, max_value=12, step=1, key="recycling_steps")
+        diffusion_samples = st.number_input("Diffusion samples", min_value=1, max_value=16, step=1, key="diffusion_samples")
+        sampling_steps_affinity = st.number_input("Affinity sampling steps", min_value=10, max_value=400, step=10, key="sampling_steps_affinity")
+        diffusion_samples_affinity = st.number_input("Affinity diffusion samples", min_value=1, max_value=16, step=1, key="diffusion_samples_affinity")
+        affinity_mw_correction = st.checkbox("Affinity molecular-weight correction", key="affinity_mw_correction")
 
     if st.button("Stop application", type="secondary", use_container_width=True):
         st.warning("Stopping Streamlit. This browser tab will disconnect and the port will be freed.")
@@ -1291,6 +1328,7 @@ runtime_settings = {
     "diffusion_samples_affinity": int(diffusion_samples_affinity),
     "affinity_mw_correction": bool(affinity_mw_correction),
 }
+save_user_settings(runtime_settings)
 
 if "input_hash_backfill_done" not in st.session_state:
     updated_hash_count = backfill_input_hashes(runtime_settings["cache_dir"])
