@@ -5,6 +5,7 @@ Host-side Streamlit app that launches `boltz predict` inside Docker (`ovoex-bolt
 ## Repository layout
 
 - `app.py`: Streamlit interface
+- `boltz2_app_local/cli.py`: `boltzapp` / `boltz-app` launcher
 - `boltz_runner.py`: YAML generation, MSA cache handling, and docker command execution
 - `visualization.py`: structure + confidence plots
 - `run.sh`: launcher (auto-port + auto-browser)
@@ -26,25 +27,22 @@ docker build -t ovoex-boltz2 .
 ```bash
 conda env create -f environment.yml
 conda activate boltz2-ui
+python -m pip install -e .
 ```
 
 ### 3) Run UI
 
 ```bash
-bash run.sh
+boltzapp
 ```
 
-The launcher selects the first free port between `8501` and `8510` and opens the browser automatically.
+This starts Streamlit from `app.py` and opens the browser.
 
-## One-command launcher
-
-If `/home/user/.local/bin` is on your `PATH`, you can run:
+Alternative launcher:
 
 ```bash
-app
+bash run.sh
 ```
-
-This uses `/home/user/mambaforge/bin/conda run -n boltz2-ui` and starts the app from this project directory.
 
 ## Runtime defaults
 
@@ -70,6 +68,11 @@ You can also override these inside the app sidebar.
 - Physics toggle (`--use_potentials`).
 - YAML preview popover before execution.
 - Local MSA repository by sequence hash.
+- Batch mode for ligands and sequences.
+- Batch + job pagination in landing view.
+- Batch and job multi-select delete.
+- Batch summary table for ligand and sequence batches with sortable structural metrics.
+- Job detail view includes `input.yaml` preview and download.
 - MSA cache hardening:
   - validates cached `.a3m` before use
   - strips trailing NUL bytes when possible

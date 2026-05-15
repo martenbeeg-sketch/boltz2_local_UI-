@@ -1203,6 +1203,17 @@ def render_result_view(job_record: dict) -> None:
             mime="application/zip",
             use_container_width=True,
         )
+        input_yaml_path = Path(job_dir) / "input.yaml"
+        if input_yaml_path.exists():
+            with st.expander("Input YAML", expanded=False):
+                st.code(input_yaml_path.read_text(encoding="utf-8"), language="yaml")
+                st.download_button(
+                    "Download input YAML",
+                    data=input_yaml_path.read_bytes(),
+                    file_name="input.yaml",
+                    mime="text/yaml",
+                    use_container_width=True,
+                )
     st.text_area("Logs", result.get("raw_log", ""), height=320)
 
 

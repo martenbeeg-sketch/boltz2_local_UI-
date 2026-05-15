@@ -12,14 +12,15 @@
 cd /home/user/programs/git-projects/boltz2-app-local
 conda env create -f environment.yml
 conda activate boltz2-ui
+python -m pip install -e .
 docker build -t ovoex-boltz2 .
-bash run.sh
+boltzapp
 ```
 
-Or with the global launcher command:
+Alternative start command:
 
 ```bash
-app
+bash run.sh
 ```
 
 ## Optional runtime variables
